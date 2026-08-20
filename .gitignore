@@ -1,0 +1,62 @@
+# ==========================================
+# Go 语言项目 .gitignore
+# ==========================================
+
+# ---------- 二进制可执行文件 ----------
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# ---------- Go 构建产物 ----------
+
+# `go test` 生成的测试二进制
+*.test
+
+# ---------- Go 工具产物 ----------
+# Go 1.24+ 的构建缓存/校验目录
+build/
+*.out
+
+# coverage 文件
+*.cover
+coverage.txt
+coverage.html
+
+# ---------- 测试数据 / 运行时生成文件 ----------
+*.json
+*.txt
+*.json.bak
+
+# ---------- IDE / 编辑器 ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---------- 操作系统文件 ----------
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+
+# ---------- 依赖 / 模块 ----------
+# Go 模块缓存（vendor 通常需要提交，但下载缓存不应提交）
+vendor/
+.glide/
+
+# ---------- 日志 / 临时文件 ----------
+*.log
+*.tmp
+tmp/
