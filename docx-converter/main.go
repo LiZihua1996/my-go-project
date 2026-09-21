@@ -23,22 +23,24 @@
 package main
 
 import (
-	"archive/zip"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
 	"image/png"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/fumiama/go-docx"
+	"github.com/ZeroHawkeye/wordZero/pkg/document"
 	"golang.org/x/image/bmp"
 )
 
@@ -86,6 +88,11 @@ func run(input, output, jsonStr, images, engine string) error {
 	logf("input: %s", input)
 	logf("output: %s", output)
 
+	// wordZero 默认把 Info 级日志写到 stdout，会污染本工具 stdout 的
+	// 结果输出，这里把它的日志降级并改道 stderr。
+	document.SetGlobalLevel(document.LogLevelWarn)
+	document.SetGlobalOutput(os.Stderr)
+
 	// 解析 JSON 替换表，例如 {"{Name}":"Mike","{Date}":"2026-08-01"}
 	replacements := make(map[string]string)
 	if jsonStr != "" {
@@ -110,21 +117,15 @@ func run(input, output, jsonStr, images, engine string) error {
 		return fmt.Errorf("unsupported output extension %q, want .docx or .pdf", ext)
 	}
 
-	// 读取输入 docx（预先去掉 zip 中的目录条目，见 readDocxSkipDirEntries）
-	data, err := readDocxSkipDirEntries(input)
-	if err != nil {
-		return err
-	}
-
-	// 用 go-docx 解析文档。Parse 需要 io.ReaderAt 和文件大小，
-	// 这里用内存中的字节切片构造。
-	doc, err := docx.Parse(bytes.NewReader(data), int64(len(data)))
+	// 用 wordZero 打开并解析文档（正文段落、表格、节属性等都会解析，
+	// 未知的 zip 条目如目录条目会被原样保留在 parts 里，不会报错）
+	doc, err := document.Open(input)
 	if err != nil {
 		return err
 	}
 
 	// 遍历文档正文的所有段落（含表格单元格内的段落），替换文本占位符。
-	forEachParagraph(doc, func(p *docx.Paragraph) {
+	forEachParagraph(doc, func(p *document.Paragraph) {
 		replaceInParagraph(p, replacements)
 	})
 
@@ -136,20 +137,18 @@ func run(input, output, jsonStr, images, engine string) error {
 
 	if strings.EqualFold(filepath.Ext(output), ".pdf") {
 		// 输出 pdf：先把替换后的文档写到一个临时 docx，
-		// 再由 docxToPDF（office2pdf 优先，COM 回退）转成 pdf。
+		// 再由 docxToPDF 转成 pdf。
 		tmp, err := os.CreateTemp("", "docx-converter-*.docx")
 		if err != nil {
 			return err
 		}
 		// 无论成败，函数返回时删除临时文件
 		defer os.Remove(tmp.Name())
-
-		if _, err := doc.WriteTo(tmp); err != nil {
-			tmp.Close()
-			return err
-		}
 		// 必须先关闭文件句柄，否则 Windows 上 Word 可能打不开它
 		if err := tmp.Close(); err != nil {
+			return err
+		}
+		if err := doc.Save(tmp.Name()); err != nil {
 			return err
 		}
 
@@ -158,15 +157,7 @@ func run(input, output, jsonStr, images, engine string) error {
 		}
 	} else {
 		// 输出 docx：直接把替换后的文档写到目标路径
-		out, err := os.Create(output)
-		if err != nil {
-			return err
-		}
-		if _, err := doc.WriteTo(out); err != nil {
-			out.Close()
-			return err
-		}
-		if err := out.Close(); err != nil {
+		if err := doc.Save(output); err != nil {
 			return err
 		}
 	}
@@ -385,74 +376,34 @@ func psEscape(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
 }
 
-// readDocxSkipDirEntries 读取 docx 文件，并把其中的 zip 目录条目
-// （名字以 / 结尾的条目，如 "_rels/"、"word/"）剔除后返回新的字节流。
-//
-// docx 本质是一个 zip 压缩包。很多工具生成的 docx 会包含目录条目，
-// 而当前版本的 go-docx 会把这些目录条目记入文件列表，回写时尝试
-// 打开它们并报错 "open _rels/: invalid argument"。
-// 这里预先重写一遍 zip，跳过目录条目，规避这个问题。
-func readDocxSkipDirEntries(path string) ([]byte, error) {
-	r, err := zip.OpenReader(path)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-
-	var buf bytes.Buffer
-	w := zip.NewWriter(&buf)
-	for _, f := range r.File {
-		// 跳过目录条目
-		if strings.HasSuffix(f.Name, "/") {
-			continue
-		}
-		rc, err := f.Open()
-		if err != nil {
-			return nil, err
-		}
-		wc, err := w.Create(f.Name)
-		if err != nil {
-			rc.Close()
-			return nil, err
-		}
-		_, err = io.Copy(wc, rc)
-		rc.Close()
-		if err != nil {
-			return nil, err
-		}
-	}
-	if err := w.Close(); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
 // replaceInParagraph 在一个段落内替换所有占位符。
 //
-// docx 的段落由若干 run（*docx.Run）组成，run 内的 *docx.Text 才是文字。
+// docx 的段落由若干 run 组成，run 内的 Text.Content 才是文字。
 // Word 经常会把同一句话拆到多个 run 里（例如改过一次格式），
-// 所以占位符可能横跨多个文本节点，例如 "{Na" + "me}"。
+// 所以占位符可能横跨多个 run，例如 "{Na" + "me}"。
 //
 // 替换分两步：
-//  1. 先在每个文本节点内部单独替换（覆盖最常见的不拆分情况，
+//  1. 先在每个 run 内部单独替换（覆盖最常见的不拆分情况，
 //     这样不会改变任何格式）；
 //  2. 如果整段拼起来仍然含有占位符，说明它被拆到了多个 run 里，
-//     这时把整段替换后的文字塞进第一个文本节点、清空其余节点。
+//     这时把整段替换后的文字塞进第一个有文本的 run、清空其余文本 run。
 //     兜底方案会丢失段落中间 run 的独立格式，但能保证占位符被替换掉。
-func replaceInParagraph(p *docx.Paragraph, replacements map[string]string) {
-	texts := textNodes(p)
-
-	// 第一步：逐节点替换
-	for _, t := range texts {
+func replaceInParagraph(p *document.Paragraph, replacements map[string]string) {
+	// 第一步：逐 run 替换
+	for i := range p.Runs {
 		for old, new := range replacements {
-			t.Text = strings.ReplaceAll(t.Text, old, new)
+			p.Runs[i].Text.Content = strings.ReplaceAll(p.Runs[i].Text.Content, old, new)
 		}
 	}
 
-	// 拼接整段文字，检查是否还有跨节点的占位符
+	// 拼接整段文字（只统计有文本的 run），检查是否还有跨 run 的占位符
+	var textRuns []int
 	var joined strings.Builder
-	for _, t := range texts {
-		joined.WriteString(t.Text)
+	for i := range p.Runs {
+		if p.Runs[i].Text.Content != "" {
+			textRuns = append(textRuns, i)
+			joined.WriteString(p.Runs[i].Text.Content)
+		}
 	}
 	full := joined.String()
 
@@ -464,50 +415,98 @@ func replaceInParagraph(p *docx.Paragraph, replacements map[string]string) {
 		}
 	}
 
-	// 第二步：存在跨节点占位符时，整段合并到第一个文本节点
-	if dirty && len(texts) > 0 {
-		texts[0].Text = full
-		for _, t := range texts[1:] {
-			t.Text = ""
+	// 第二步：存在跨 run 占位符时，整段合并到第一个文本 run
+	if dirty && len(textRuns) > 0 {
+		p.Runs[textRuns[0]].Text.Content = full
+		for _, i := range textRuns[1:] {
+			p.Runs[i].Text.Content = ""
 		}
 	}
 }
 
-// textNodes 返回段落中所有 run 里的文本节点（*docx.Text），
-// 按文档顺序排列。
-func textNodes(p *docx.Paragraph) []*docx.Text {
-	var texts []*docx.Text
-	for _, child := range p.Children {
-		if run, ok := child.(*docx.Run); ok {
-			for _, rc := range run.Children {
-				if t, ok := rc.(*docx.Text); ok {
-					texts = append(texts, t)
-				}
-			}
-		}
+// paragraphText 返回段落所有 run 拼接后的完整文字。
+func paragraphText(p *document.Paragraph) string {
+	var joined strings.Builder
+	for i := range p.Runs {
+		joined.WriteString(p.Runs[i].Text.Content)
 	}
-	return texts
+	return joined.String()
 }
 
 // imagePlaceholders 是可被 --images 替换的图片占位符。
 // 单复数两种写法都认，防止模板里写错。
 var imagePlaceholders = []string{"{ImagesPlaceholder}", "{ImagePlaceholder}"}
 
+// imagesPerRow 是图片占位符处每行最多排列的图片张数，
+// 多出来的图片会在段内换行另起一行。
+const imagesPerRow = 3
+
+// contentWidthEMU 返回正文可用宽度（页面宽减去左右边距），单位 EMU
+// （1mm = 36000 EMU，1 英寸 = 914400 EMU = 1440 twips）。
+// 页面尺寸和边距取自文档的节属性；读不到时按 A4 加 Word 默认边距估算。
+func contentWidthEMU(doc *document.Document) int64 {
+	twipsToMM := func(s string) (float64, bool) {
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil || v <= 0 {
+			return 0, false
+		}
+		return v / 1440 * 25.4, true
+	}
+
+	pageWidthMM := 210.0 // A4 宽
+	marginLeftMM, marginRightMM := 25.4, 25.4
+	for _, item := range doc.Body.Elements {
+		sect, ok := item.(*document.SectionProperties)
+		if !ok {
+			continue
+		}
+		if sect.PageSize != nil {
+			if w, ok := twipsToMM(sect.PageSize.W); ok {
+				pageWidthMM = w
+			}
+		}
+		if sect.PageMargins != nil {
+			if v, ok := twipsToMM(sect.PageMargins.Left); ok {
+				marginLeftMM = v
+			}
+			if v, ok := twipsToMM(sect.PageMargins.Right); ok {
+				marginRightMM = v
+			}
+		}
+	}
+	contentMM := pageWidthMM - marginLeftMM - marginRightMM
+	if contentMM <= 0 {
+		contentMM = 210 - 2*25.4
+	}
+	return int64(contentMM * 36000)
+}
+
 // forEachParagraph 遍历文档正文的所有段落，包括表格单元格里的段落。
-// 正文顶层元素只有两类：段落（Paragraph）和表格（Table）；
-// 表格需要逐行、逐单元格找到其中的段落。
-func forEachParagraph(doc *docx.Docx, fn func(p *docx.Paragraph)) {
-	for _, item := range doc.Document.Body.Items {
+// 正文顶层元素只有两类：段落（Paragraph）和表格（Table）。
+func forEachParagraph(doc *document.Document, fn func(p *document.Paragraph)) {
+	for _, item := range doc.Body.Elements {
 		switch v := item.(type) {
-		case *docx.Paragraph:
+		case *document.Paragraph:
 			fn(v)
-		case *docx.Table:
-			for _, row := range v.TableRows {
-				for _, cell := range row.TableCells {
-					for _, p := range cell.Paragraphs {
-						fn(p)
-					}
-				}
+		case *document.Table:
+			forEachTableParagraph(v, fn)
+		}
+	}
+}
+
+// forEachTableParagraph 遍历表格中的所有段落，包括单元格内嵌套表格的段落。
+// wordZero 的 TableRow/TableCell/Paragraph 都是值类型切片，
+// 必须按索引取指针，改动才能写回原数据。
+func forEachTableParagraph(t *document.Table, fn func(p *document.Paragraph)) {
+	for ri := range t.Rows {
+		row := &t.Rows[ri]
+		for ci := range row.Cells {
+			cell := &row.Cells[ci]
+			for pi := range cell.Paragraphs {
+				fn(&cell.Paragraphs[pi])
+			}
+			for ti := range cell.Tables {
+				forEachTableParagraph(&cell.Tables[ti], fn)
 			}
 		}
 	}
@@ -517,7 +516,7 @@ func forEachParagraph(doc *docx.Docx, fn func(p *docx.Paragraph)) {
 //   - images 非空（形如 "a.png;b.bmp"）：先把占位符文本删掉，
 //     再按顺序把每张图作为 inline drawing 插入到占位符所在段落；
 //   - images 为空：只删除占位符文本。
-func replaceImagePlaceholder(doc *docx.Docx, images string) error {
+func replaceImagePlaceholder(doc *document.Document, images string) error {
 	var paths []string
 	for _, p := range strings.Split(images, ";") {
 		if p = strings.TrimSpace(p); p != "" {
@@ -541,16 +540,13 @@ func replaceImagePlaceholder(doc *docx.Docx, images string) error {
 		datas    [][]byte
 		loaded   bool
 	)
-	forEachParagraph(doc, func(p *docx.Paragraph) {
+	forEachParagraph(doc, func(p *document.Paragraph) {
 		// 占位符可能被拆到多个 run 里，拼接整段文字再判断是否存在，
-		// 避免漏掉跨节点拆分的情况。
-		var joined strings.Builder
-		for _, t := range textNodes(p) {
-			joined.WriteString(t.Text)
-		}
+		// 避免漏掉跨 run 拆分的情况。
+		full := paragraphText(p)
 		hasPlaceholder := false
 		for _, ph := range imagePlaceholders {
-			if strings.Contains(joined.String(), ph) {
+			if strings.Contains(full, ph) {
 				hasPlaceholder = true
 				break
 			}
@@ -589,10 +585,18 @@ func replaceImagePlaceholder(doc *docx.Docx, images string) error {
 			return
 		}
 
+		// 每张图片的显示宽度定为正文可用宽度的 1/imagesPerRow，
+		// 这样一行正好排 imagesPerRow 张；减去 1mm 防止浮点舍入导致
+		// 第三张被挤到下一行。
+		widthEMU := contentWidthEMU(doc)/imagesPerRow - 36000
 		for i, data := range datas {
-			if _, err := p.AddInlineDrawing(data); err != nil {
+			if err := insertImageIntoParagraph(doc, p, data, filepath.Base(paths[i]), widthEMU); err != nil {
 				firstErr = fmt.Errorf("add image %s: %w", paths[i], err)
 				return
+			}
+			// 每行最多 imagesPerRow 张，多出来的在段内换行另起一行
+			if (i+1)%imagesPerRow == 0 && i != len(datas)-1 {
+				p.Runs = append(p.Runs, document.Run{Break: &document.Break{}})
 			}
 		}
 		logf("inserted %d image(s) at image placeholder", len(datas))
@@ -600,9 +604,88 @@ func replaceImagePlaceholder(doc *docx.Docx, images string) error {
 	return firstErr
 }
 
+// insertImageIntoParagraph 把一张图片作为 inline drawing 插入到指定段落，
+// 显示宽度为 widthEMU（EMUs），高度按图片原始宽高比换算。
+//
+// wordZero 公开的 AddImageFromData 只能把图片追加到文档末尾，
+// 所以这里用 AddImageFromDataWithoutElement 注册图片资源（关系、media
+// 部件、内容类型），再手动构造 DrawingElement 挂到目标段落的 run 上
+// （结构与库内未导出的 createInlineImageDrawing/createImageGraphic 一致）。
+func insertImageIntoParagraph(doc *document.Document, p *document.Paragraph, data []byte, fileName string, widthEMU int64) error {
+	// 解析图片格式和像素尺寸（wordZero 只支持 png/jpeg/gif，
+	// bmp 已在 loadImageData 中转成 png）
+	cfg, formatName, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("decode image: %w", err)
+	}
+	var format document.ImageFormat
+	switch formatName {
+	case "png":
+		format = document.ImageFormatPNG
+	case "jpeg":
+		format = document.ImageFormatJPEG
+	case "gif":
+		format = document.ImageFormatGIF
+	default:
+		return fmt.Errorf("unsupported image format %q, want png/jpeg/gif", formatName)
+	}
+
+	// wordZero 按传入文件名的扩展名命名嵌入的媒体文件，扩展名必须
+	// 反映数据的真实格式（例如 bmp 已被转成 png），否则 Word 可能打不开。
+	fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + "." + formatName
+	info, err := doc.AddImageFromDataWithoutElement(data, fileName, format, cfg.Width, cfg.Height, nil)
+	if err != nil {
+		return err
+	}
+
+	// 宽度固定为给定的显示宽度，高度按原始宽高比等比换算
+	cx := fmt.Sprintf("%d", widthEMU)
+	cy := fmt.Sprintf("%d", widthEMU*int64(cfg.Height)/int64(cfg.Width))
+	altText := "图片"
+	name := fmt.Sprintf("图片 %s", info.ID)
+
+	p.Runs = append(p.Runs, document.Run{
+		Drawing: &document.DrawingElement{
+			Inline: &document.InlineDrawing{
+				DistT:  "0",
+				DistB:  "0",
+				DistL:  "0",
+				DistR:  "0",
+				Extent: &document.DrawingExtent{Cx: cx, Cy: cy},
+				DocPr:  &document.DrawingDocPr{ID: info.ID, Name: name, Descr: altText, Title: altText},
+				Graphic: &document.DrawingGraphic{
+					Xmlns: "http://schemas.openxmlformats.org/drawingml/2006/main",
+					GraphicData: &document.GraphicData{
+						Uri: "http://schemas.openxmlformats.org/drawingml/2006/picture",
+						Pic: &document.PicElement{
+							Xmlns: "http://schemas.openxmlformats.org/drawingml/2006/picture",
+							NvPicPr: &document.NvPicPr{
+								CNvPr:    &document.CNvPr{ID: info.ID, Name: name, Descr: altText, Title: altText},
+								CNvPicPr: &document.CNvPicPr{PicLocks: &document.PicLocks{NoChangeAspect: "1"}},
+							},
+							BlipFill: &document.BlipFill{
+								Blip:    &document.Blip{Embed: info.RelationID},
+								Stretch: &document.Stretch{FillRect: &document.FillRect{}},
+							},
+							SpPr: &document.SpPr{
+								Xfrm: &document.Xfrm{
+									Off: &document.Off{X: "0", Y: "0"},
+									Ext: &document.Ext{Cx: cx, Cy: cy},
+								},
+								PrstGeom: &document.PrstGeom{Prst: "rect", AvLst: &document.AvLst{}},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	return nil
+}
+
 // loadImageData 读取图片文件并返回可直接写入 docx 的字节。
-// go-docx 依赖 imgsz 探测图片尺寸，而 imgsz 只支持 png/jpg/gif/webp，
-// 不支持 bmp，所以 bmp 文件先在内存里转成 png 再交给 go-docx。
+// wordZero 只支持 png/jpeg/gif 三种格式，不支持 bmp，
+// 所以 bmp 文件先在内存里转成 png 再交给 wordZero。
 func loadImageData(path string) ([]byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

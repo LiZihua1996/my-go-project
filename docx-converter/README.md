@@ -4,7 +4,8 @@
 
 ## 功能
 
-- 基于 [go-docx](https://github.com/fumiama/go-docx) 解析 docx，替换正文段落和表格中的占位符
+- 基于 [wordZero](https://github.com/zerx-lab/wordZero) 解析 docx，替换正文段落和表格中的占位符
+  （注意：该仓库的 Go module 路径是 `github.com/ZeroHawkeye/wordZero`）
 - 占位符被 Word 拆分到多个 run 时也能正确替换
 - 输出 `.docx`：直接生成替换后的文档
 - 输出 `.pdf`：可用 `--engine` 指定转换引擎（`minipdf` / `office2pdf` / `pdfitdown` / `com`），
@@ -46,7 +47,9 @@ PowerShell(建议用单引号包裹 JSON):
 - JSON 必须是合法格式（key 与 value 之间是冒号），单引号写法会被自动兼容
 - 图片插入：在模板中放置 `{ImagesPlaceholder}`（兼容 `{ImagePlaceholder}` 写法），
   传入 `--images` 时占位符按顺序替换为所给图片，不传时占位符被删除；
-  bmp 图片会先转换为 png 再插入（go-docx 依赖的 imgsz 不支持 bmp）
+  插入的图片宽度按页面可用宽度（页宽减左右边距）的 1/3 缩放、高度等比换算，
+  每行最多排 3 张，多出来的自动另起一行；
+  bmp 图片会先转换为 png 再插入（wordZero 只支持 png/jpg/gif，不支持 bmp）
 - PDF 转换引擎：装了 Microsoft Word 或 WPS Office 时默认优先用 COM 自动化；
   没有 Office 环境时，把 `office2pdf.exe` 放到 docx-converter.exe 旁的 pdf-renderer 文件夹
   （可从 <https://github.com/developer0hye/office2pdf/releases> 下载），
