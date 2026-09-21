@@ -12,12 +12,14 @@
 //	-i / --input   输入的 docx 文件路径（必填）
 //	-o / --output  输出文件路径（必填），后缀为 .docx 时直接生成 docx，
 //	               后缀为 .pdf 时先替换占位符再转换为 pdf
-//	               （优先用同目录/PATH 里的 office2pdf.exe，
-//	               找不到则回退到 Word/WPS 的 COM 自动化）
+//	               （默认依次尝试：Word/WPS COM 自动化、pdf-renderer 子目录
+//	               或 PATH 里的 office2pdf.exe、minipdf.exe、pdfitdown.exe）
 //	-j / --json    JSON 字符串，key 为占位符、value 为替换后的内容（可选，
 //	               不传则只做格式转换，不做替换）
 //	-I / --images  需要插入的图片路径，多个用分号(;)分隔（可选）。
 //	               传入时替换文档中的 {ImagesPlaceholder}，不传则删除该占位符
+//	-e / --engine  PDF 转换引擎：minipdf、office2pdf、pdfitdown 或 com（可选，
+//	               默认 auto，按 COM -> office2pdf -> minipdf -> pdfitdown 自动选择）
 package main
 
 import (
@@ -34,6 +36,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fumiama/go-docx"
 	"golang.org/x/image/bmp"
@@ -42,7 +45,7 @@ import (
 // main 负责解析命令行参数并调用 run 执行主流程，
 // 出错时向 stderr 打印错误并以退出码 1 结束。
 func main() {
-	var input, output, jsonStr, images string
+	var input, output, jsonStr, images, engine string
 
 	// flag 包不支持同一参数的长短两个名字共享配置，
 	// 这里把长短两个名字绑定到同一个变量上，后出现的覆盖先出现的。
@@ -55,17 +58,24 @@ func main() {
 	flag.StringVar(&jsonStr, "j", "", "JSON object (shorthand)")
 	flag.StringVar(&images, "images", "", "image file paths separated by ';'")
 	flag.StringVar(&images, "I", "", "image file paths (shorthand)")
+	flag.StringVar(&engine, "engine", "", "pdf engine: minipdf, office2pdf, com (default auto)")
+	flag.StringVar(&engine, "e", "", "pdf engine (shorthand)")
 	flag.Parse()
 
-	if err := run(input, output, jsonStr, images); err != nil {
+	if err := run(input, output, jsonStr, images, engine); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
+// logf 向 stderr 输出执行过程信息，不污染 stdout 的结果输出。
+func logf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "[docx-converter] "+format+"\n", args...)
+}
+
 // run 是主流程：校验参数 -> 解析 JSON 与图片列表 -> 读取并替换 docx
 // -> 按后缀输出 docx 或 pdf。
-func run(input, output, jsonStr, images string) error {
+func run(input, output, jsonStr, images, engine string) error {
 	// 必填参数校验
 	if input == "" {
 		return errors.New("--input is required")
@@ -73,6 +83,8 @@ func run(input, output, jsonStr, images string) error {
 	if output == "" {
 		return errors.New("--output is required")
 	}
+	logf("input: %s", input)
+	logf("output: %s", output)
 
 	// 解析 JSON 替换表，例如 {"{Name}":"Mike","{Date}":"2026-08-01"}
 	replacements := make(map[string]string)
@@ -89,6 +101,7 @@ func run(input, output, jsonStr, images string) error {
 			}
 		}
 	}
+	logf("loaded %d placeholder replacement(s)", len(replacements))
 
 	// 根据输出文件后缀决定输出格式，只支持 .docx 和 .pdf
 	switch ext := strings.ToLower(filepath.Ext(output)); ext {
@@ -140,7 +153,7 @@ func run(input, output, jsonStr, images string) error {
 			return err
 		}
 
-		if err := docxToPDF(tmp.Name(), output); err != nil {
+		if err := docxToPDF(tmp.Name(), output, engine); err != nil {
 			return err
 		}
 	} else {
@@ -162,35 +175,134 @@ func run(input, output, jsonStr, images string) error {
 	return nil
 }
 
-// docxToPDF 把 docx 转换为 pdf。优先使用同目录或 PATH 中的
-// office2pdf.exe（独立可执行文件，不依赖 Office/WPS，速度约 2s）；
-// 找不到或转换失败时回退到 Word/WPS 的 COM 自动化（兼容旧行为）。
-func docxToPDF(docxPath, pdfPath string) error {
-	if exe := findOffice2PDF(); exe != "" {
-		if err := office2pdfToPDF(exe, docxPath, pdfPath); err == nil {
-			return nil
-		}
-		// office2pdf 失败时继续尝试 COM，不直接报错
+// docxToPDF 把 docx 转换为 pdf。engine 指定转换引擎：
+//   - ""/"auto"：按 Word/WPS COM -> office2pdf -> minipdf -> pdfitdown
+//     的顺序自动选择，前一个不可用或失败时自动尝试下一个；
+//   - "minipdf" / "office2pdf" / "pdfitdown"：只用对应的命令行引擎，
+//     找不到或失败直接报错，不回退；
+//   - "com"：只用 Word/WPS 的 COM 自动化。
+func docxToPDF(docxPath, pdfPath, engine string) error {
+	start := time.Now()
+	var err error
+	switch strings.ToLower(engine) {
+	case "", "auto":
+		err = docxToPDFAuto(docxPath, pdfPath)
+	case "minipdf", "office2pdf", "pdfitdown":
+		err = cliEngineToPDF(strings.ToLower(engine)+".exe", docxPath, pdfPath)
+	case "com":
+		logf("converting to pdf with Word/WPS COM automation")
+		err = docxToPDFViaWord(docxPath, pdfPath)
+	default:
+		return fmt.Errorf("invalid --engine %q, want minipdf, office2pdf, pdfitdown, com or auto", engine)
 	}
-	return docxToPDFViaWord(docxPath, pdfPath)
+	if err != nil {
+		return err
+	}
+	logf("pdf conversion finished in %s", time.Since(start).Round(time.Millisecond))
+	return nil
 }
 
-// findOffice2PDF 查找 office2pdf.exe：先找本程序同目录，再找 PATH。
-func findOffice2PDF() string {
-	if self, err := os.Executable(); err == nil {
-		p := filepath.Join(filepath.Dir(self), "office2pdf.exe")
-		if _, err := os.Stat(p); err == nil {
-			return p
+// docxToPDFAuto 按 Word/WPS COM -> office2pdf -> minipdf -> pdfitdown
+// 的优先级自动尝试各转换引擎，全部不可用时返回错误。
+func docxToPDFAuto(docxPath, pdfPath string) error {
+	if wordCOMAvailable() {
+		logf("converting to pdf with Word/WPS COM automation")
+		if err := docxToPDFViaWord(docxPath, pdfPath); err == nil {
+			return nil
+		} else {
+			logf("word com failed: %v; trying next engine", err)
+		}
+	} else {
+		logf("Word/WPS COM not available, trying next engine")
+	}
+
+	var lastErr error
+	for _, e := range cliEngines {
+		exe := findToolExe(e.name)
+		if exe == "" {
+			logf("%s not found, trying next engine", e.name)
+			continue
+		}
+		logf("converting to pdf with %s (%s)", e.name, exe)
+		if err := cliToPDF(exe, e, docxPath, pdfPath); err != nil {
+			logf("%s failed: %v; trying next engine", e.name, err)
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return errors.New("no pdf engine available: install Word/WPS, office2pdf, minipdf or pdfitdown")
+}
+
+// wordCOMAvailable 通过查询注册表判断 Word.Application COM 组件是否已注册
+// （Microsoft Word 和 WPS Office 安装后都会注册这个 ProgID）。
+// 比直接启动 COM 试转快得多，也不会在没有 Office 的机器上刷错误输出。
+func wordCOMAvailable() bool {
+	return exec.Command("reg", "query", `HKCR\Word.Application`).Run() == nil
+}
+
+// cliEngine 描述一个命令行 PDF 转换引擎：可执行文件名，
+// 以及由输入 docx 路径和输出 pdf 路径构造命令行参数的方式
+// （各工具的参数形式不同，如 office2pdf/minipdf 是位置参数，
+// pdfitdown 是 -i/-o 选项）。
+type cliEngine struct {
+	name string
+	args func(docxPath, pdfPath string) []string
+}
+
+// cliEngines 是 auto 模式下在 COM 之后依次尝试的命令行引擎。
+var cliEngines = []cliEngine{
+	{"office2pdf.exe", func(d, p string) []string { return []string{d, "-o", p} }},
+	{"minipdf.exe", func(d, p string) []string { return []string{d, "-o", p} }},
+	{"pdfitdown.exe", func(d, p string) []string { return []string{"-i", d, "-o", p} }},
+}
+
+// cliEngineToPDF 使用用户显式指定的命令行引擎转换，
+// 找不到或失败时直接报错，不回退到其他引擎。
+func cliEngineToPDF(name, docxPath, pdfPath string) error {
+	var engine *cliEngine
+	for i := range cliEngines {
+		if cliEngines[i].name == name {
+			engine = &cliEngines[i]
+			break
 		}
 	}
-	if p, err := exec.LookPath("office2pdf.exe"); err == nil {
+	if engine == nil {
+		return fmt.Errorf("unknown cli engine %q", name)
+	}
+	exe := findToolExe(name)
+	if exe == "" {
+		return fmt.Errorf("%s not found (put it in the pdf-renderer folder next to docx-converter.exe, or in PATH)", name)
+	}
+	logf("converting to pdf with %s (%s)", name, exe)
+	return cliToPDF(exe, *engine, docxPath, pdfPath)
+}
+
+// findToolExe 查找名为 name 的命令行工具：先找本程序同目录下的
+// pdf-renderer 子目录，再找本程序同目录，最后找 PATH。
+func findToolExe(name string) string {
+	if self, err := os.Executable(); err == nil {
+		dir := filepath.Dir(self)
+		for _, p := range []string{
+			filepath.Join(dir, "pdf-renderer", name),
+			filepath.Join(dir, name),
+		} {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+	}
+	if p, err := exec.LookPath(name); err == nil {
 		return p
 	}
 	return ""
 }
 
-// office2pdfToPDF 调用 office2pdf 命令行完成转换。
-func office2pdfToPDF(exe, docxPath, pdfPath string) error {
+// cliToPDF 调用命令行转换工具完成转换，命令行参数由引擎描述构造。
+func cliToPDF(exe string, engine cliEngine, docxPath, pdfPath string) error {
 	docxAbs, err := filepath.Abs(docxPath)
 	if err != nil {
 		return err
@@ -203,13 +315,14 @@ func office2pdfToPDF(exe, docxPath, pdfPath string) error {
 	// 先删除旧的输出文件，避免把上次运行的残留误认为本次成功
 	os.Remove(pdfAbs)
 
-	cmd := exec.Command(exe, docxAbs, "-o", pdfAbs)
+	cmd := exec.Command(exe, engine.args(docxAbs, pdfAbs)...)
 	out, cmdErr := cmd.CombinedOutput()
 	if _, err := os.Stat(pdfAbs); err != nil {
+		name := filepath.Base(exe)
 		if cmdErr != nil {
-			return fmt.Errorf("office2pdf: %w: %s", cmdErr, out)
+			return fmt.Errorf("%s: %w: %s", name, cmdErr, out)
 		}
-		return fmt.Errorf("office2pdf: pdf not created: %s", out)
+		return fmt.Errorf("%s: pdf not created: %s", name, out)
 	}
 	return nil
 }
@@ -411,6 +524,11 @@ func replaceImagePlaceholder(doc *docx.Docx, images string) error {
 			paths = append(paths, p)
 		}
 	}
+	if len(paths) > 0 {
+		logf("loading %d image(s): %s", len(paths), strings.Join(paths, ", "))
+	} else {
+		logf("no --images given, image placeholders will be removed")
+	}
 
 	// 删除占位符用的替换表：占位符 -> 空串
 	remove := make(map[string]string, len(imagePlaceholders))
@@ -477,6 +595,7 @@ func replaceImagePlaceholder(doc *docx.Docx, images string) error {
 				return
 			}
 		}
+		logf("inserted %d image(s) at image placeholder", len(datas))
 	})
 	return firstErr
 }
@@ -492,6 +611,7 @@ func loadImageData(path string) ([]byte, error) {
 	if !strings.EqualFold(filepath.Ext(path), ".bmp") {
 		return data, nil
 	}
+	logf("converting bmp to png: %s", path)
 	img, err := bmp.Decode(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("decode bmp %s: %w", path, err)

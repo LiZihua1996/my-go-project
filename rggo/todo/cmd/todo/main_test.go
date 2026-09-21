@@ -6,7 +6,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 )
 
@@ -37,7 +36,7 @@ func TestMain(m *testing.M) {
 }
 
 func TestTodoCLI(t *testing.T) {
-	var task = "test task"
+	var task_name = "test task"
 
 	var dir, err = os.Getwd() // 获取当前工作目录
 	if err != nil {
@@ -48,7 +47,7 @@ func TestTodoCLI(t *testing.T) {
 
 	//调用todo.exe添加新任务
 	t.Run("AddNewTask", func(t *testing.T) {
-		var cmd = exec.Command(cmd_path, strings.Split(task, " ")...) // 构建命令
+		var cmd = exec.Command(cmd_path, "-add", task_name) // 构建命令
 		if err := cmd.Run(); err != nil {
 			t.Fatal(err)
 		}
@@ -56,13 +55,13 @@ func TestTodoCLI(t *testing.T) {
 
 	//调用todo.exe看看输出的任务名称和刚才添加的任务名称是否一致
 	t.Run("ListTasks", func(t *testing.T) {
-		var cmd = exec.Command(cmd_path)
+		var cmd = exec.Command(cmd_path, "-list")
 		var out, err = cmd.CombinedOutput()
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		var expected = task + "\n"
+		var expected = task_name + "\n"
 		if string(out) != expected {
 			t.Errorf("Expected %q, got %q instead", expected, string(out))
 		}

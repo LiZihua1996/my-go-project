@@ -8,24 +8,24 @@ import (
 	"time"
 )
 
-// todo_item 待办事项项
-type todo_item struct {
-	Description  string
-	Done         bool
-	CreatedAt    time.Time
-	CompleteedAt time.Time
+// TodoItem 待办事项项
+type TodoItem struct {
+	Description string
+	Done        bool
+	CreatedAt   time.Time
+	CompletedAt time.Time
 }
 
 // TodoList 待办事项列表
-type TodoList []todo_item
+type TodoList []TodoItem
 
 // Add 添加待办事项
 func (l *TodoList) Add(task string) {
-	var t = todo_item{
-		Description:  task,
-		Done:         false,
-		CreatedAt:    time.Now(),
-		CompleteedAt: time.Time{},
+	var t = TodoItem{
+		Description: task,
+		Done:        false,
+		CreatedAt:   time.Now(),
+		CompletedAt: time.Time{},
 	}
 	*l = append(*l, t)
 }
@@ -34,10 +34,10 @@ func (l *TodoList) Add(task string) {
 func (l *TodoList) Complete(i int) error {
 	var list = *l
 	if i < 0 || i >= len(list) {
-		return fmt.Errorf("index out of range")
+		return fmt.Errorf("Complete: index out of range")
 	}
 	list[i].Done = true
-	list[i].CompleteedAt = time.Now()
+	list[i].CompletedAt = time.Now()
 	return nil
 }
 
@@ -45,7 +45,7 @@ func (l *TodoList) Complete(i int) error {
 func (l *TodoList) Delete(i int) error {
 	var list = *l
 	if i < 0 || i >= len(list) {
-		return fmt.Errorf("index out of range")
+		return fmt.Errorf("Delete: index out of range")
 	}
 	*l = append(list[:i], list[i+1:]...)
 	return nil
@@ -78,3 +78,24 @@ func (l *TodoList) Load(filname string) error {
 
 	return json.Unmarshal(bytes, l)
 }
+
+func (l *TodoList) String() string {
+	var formatted = ""
+	for index, item := range *l {
+		var prefix = "[ ]"
+		if item.Done {
+			prefix = "[X]"
+		}
+		formatted += fmt.Sprintf("%s %d: %s\n", prefix, index, item.Description)
+
+	}
+	return formatted
+}
+
+// func (l *TodoList) PrintAll() {
+// 	for index, item := range *l {
+// 		if !item.Done {
+// 			fmt.Printf("%d. %s\n", index, item.Description)
+// 		}
+// 	}
+// }
