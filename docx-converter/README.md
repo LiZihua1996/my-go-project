@@ -7,7 +7,9 @@
 - 基于 [go-docx](https://github.com/fumiama/go-docx) 解析 docx，替换正文段落和表格中的占位符
 - 占位符被 Word 拆分到多个 run 时也能正确替换
 - 输出 `.docx`：直接生成替换后的文档
-- 输出 `.pdf`：通过本机 Microsoft Word(COM 自动化）转换为 PDF，仅支持 Windows 且需安装 Word
+- 输出 `.pdf`：优先使用同目录或 PATH 中的 [office2pdf](https://github.com/developer0hye/office2pdf)
+  （独立 exe，不依赖 Office/WPS，约 2s）；找不到时回退到 Word/WPS 的 COM 自动化
+  （仅 Windows，需安装 Microsoft Word 或 WPS Office）
 
 ## 构建
 
@@ -36,7 +38,9 @@ PowerShell（建议用单引号包裹 JSON):
 说明：
 
 - JSON 必须是合法格式（key 与 value 之间是冒号），单引号写法会被自动兼容
-- 转换 PDF 依赖 Microsoft Word，未安装 Word 的机器只能输出 docx
 - 图片插入：在模板中放置 `{ImagesPlaceholder}`（兼容 `{ImagePlaceholder}` 写法），
   传入 `--images` 时占位符按顺序替换为所给图片，不传时占位符被删除；
   bmp 图片会先转换为 png 再插入（go-docx 依赖的 imgsz 不支持 bmp）
+- PDF 转换引擎：把 `office2pdf.exe` 放到 docx-converter.exe 同目录（推荐，
+  可从 <https://github.com/developer0hye/office2pdf/releases> 下载），
+  即可享受无 Office 依赖的快速转换；没有它则自动回退到本机 Word/WPS 的 COM 自动化

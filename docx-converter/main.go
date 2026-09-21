@@ -11,7 +11,9 @@
 //
 //	-i / --input   输入的 docx 文件路径（必填）
 //	-o / --output  输出文件路径（必填），后缀为 .docx 时直接生成 docx，
-//	               后缀为 .pdf 时先替换占位符再通过 Word 转换为 pdf
+//	               后缀为 .pdf 时先替换占位符再转换为 pdf
+//	               （优先用同目录/PATH 里的 office2pdf.exe，
+//	               找不到则回退到 Word/WPS 的 COM 自动化）
 //	-j / --json    JSON 字符串，key 为占位符、value 为替换后的内容（可选，
 //	               不传则只做格式转换，不做替换）
 //	-I / --images  需要插入的图片路径，多个用分号(;)分隔（可选）。
@@ -121,7 +123,7 @@ func run(input, output, jsonStr, images string) error {
 
 	if strings.EqualFold(filepath.Ext(output), ".pdf") {
 		// 输出 pdf：先把替换后的文档写到一个临时 docx，
-		// 再通过 Word COM 把临时 docx 另存为 pdf。
+		// 再由 docxToPDF（office2pdf 优先，COM 回退）转成 pdf。
 		tmp, err := os.CreateTemp("", "docx-converter-*.docx")
 		if err != nil {
 			return err
@@ -160,10 +162,63 @@ func run(input, output, jsonStr, images string) error {
 	return nil
 }
 
-// docxToPDF 通过 Microsoft Word 的 COM 自动化接口把 docx 转换为 pdf。
-// 原理是启动一个隐藏的 Word 进程，打开文档后另存为 PDF（wdFormatPDF = 17），
-// 最后退出 Word。依赖本机安装 Microsoft Word，仅适用于 Windows。
+// docxToPDF 把 docx 转换为 pdf。优先使用同目录或 PATH 中的
+// office2pdf.exe（独立可执行文件，不依赖 Office/WPS，速度约 2s）；
+// 找不到或转换失败时回退到 Word/WPS 的 COM 自动化（兼容旧行为）。
 func docxToPDF(docxPath, pdfPath string) error {
+	if exe := findOffice2PDF(); exe != "" {
+		if err := office2pdfToPDF(exe, docxPath, pdfPath); err == nil {
+			return nil
+		}
+		// office2pdf 失败时继续尝试 COM，不直接报错
+	}
+	return docxToPDFViaWord(docxPath, pdfPath)
+}
+
+// findOffice2PDF 查找 office2pdf.exe：先找本程序同目录，再找 PATH。
+func findOffice2PDF() string {
+	if self, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(self), "office2pdf.exe")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	if p, err := exec.LookPath("office2pdf.exe"); err == nil {
+		return p
+	}
+	return ""
+}
+
+// office2pdfToPDF 调用 office2pdf 命令行完成转换。
+func office2pdfToPDF(exe, docxPath, pdfPath string) error {
+	docxAbs, err := filepath.Abs(docxPath)
+	if err != nil {
+		return err
+	}
+	pdfAbs, err := filepath.Abs(pdfPath)
+	if err != nil {
+		return err
+	}
+
+	// 先删除旧的输出文件，避免把上次运行的残留误认为本次成功
+	os.Remove(pdfAbs)
+
+	cmd := exec.Command(exe, docxAbs, "-o", pdfAbs)
+	out, cmdErr := cmd.CombinedOutput()
+	if _, err := os.Stat(pdfAbs); err != nil {
+		if cmdErr != nil {
+			return fmt.Errorf("office2pdf: %w: %s", cmdErr, out)
+		}
+		return fmt.Errorf("office2pdf: pdf not created: %s", out)
+	}
+	return nil
+}
+
+// docxToPDFViaWord 通过 COM 自动化把 docx 转换为 pdf。
+// 原理是启动一个隐藏的 Word 进程，打开文档后另存为 PDF（wdFormatPDF = 17），
+// 最后退出 Word。依赖本机安装的 Word.Application COM 组件
+// （Microsoft Word 或 WPS Office 均可），仅适用于 Windows。
+func docxToPDFViaWord(docxPath, pdfPath string) error {
 	// COM 接口要求使用绝对路径
 	docxAbs, err := filepath.Abs(docxPath)
 	if err != nil {
